@@ -227,3 +227,4 @@ items/*
 csv
 csv/*
 push_items.py
+test.json
