@@ -226,3 +226,4 @@ items
 items/*
 csv
 csv/*
+push_items.py
