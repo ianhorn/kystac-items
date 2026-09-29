@@ -1,8 +1,19 @@
 import datetime
 import json
+import os
 import os.path
 import struct
+import sys
+import time
+import urllib.parse
 import urllib.request
+
+# rasterio/pyproj need PROJ_DATA to find proj.db. Conda normally sets this
+# via activation scripts, which don't run if this interpreter was launched
+# directly (e.g. VS Code's "Run Python File" without an activated terminal).
+os.environ.setdefault(
+    "PROJ_DATA", os.path.join(sys.prefix, "Library", "share", "proj")
+)
 
 from pdal import Pipeline
 from pyproj import CRS
@@ -38,6 +49,39 @@ DEFAULT_DIMENSION_SCHEMA = {
 }
 
 
+def _retry(fn, attempts=3, delay=1.0, exceptions=(RuntimeError, OSError)):
+    """Retries fn() on failure.
+
+    PDAL's remote (arbiter/curl) reader intermittently fails on the first
+    HTTP request of a process with a mangled URL / "File does not exist",
+    then succeeds immediately on retry. Cheap to paper over here rather than
+    debug arbiter's connection warm-up.
+    """
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except exceptions as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise last_exc
+
+
+def _thumbnail_href(href: str, item_id: str) -> str:
+    """Derives a thumbnail URL from a data URL, e.g.:
+
+    https://kyfromabove.s3.us-west-2.amazonaws.com/elevation/PointCloud/Phase3/foo.copc.laz
+    -> https://kyfromabove-stac.s3.us-west-2.amazonaws.com/collections/laz-phase3/thumbnails/foo.copc.png
+    """
+    parsed = urllib.parse.urlparse(href)
+    bucket, _, domain_rest = parsed.netloc.partition(".")
+    thumb_netloc = f"{bucket}-stac.{domain_rest}"
+    phase_folder = parsed.path.rstrip("/").split("/")[-2]
+    thumb_path = f"/collections/laz-{phase_folder.lower()}/thumbnails/{item_id}.png"
+    return urllib.parse.urlunparse((parsed.scheme, thumb_netloc, thumb_path, "", "", ""))
+
+
 def create_item_fast(href, a_srs="EPSG:4326"):
     """Like stactools.pointcloud.stac.create_item, but for COPC files only.
 
@@ -48,10 +92,10 @@ def create_item_fast(href, a_srs="EPSG:4326"):
     """
     reader = {"type": "readers.copc", "filename": href}
     pipeline = Pipeline(json.dumps([reader]))
-    info = pipeline.quickinfo["readers.copc"]
+    info = _retry(lambda: pipeline.quickinfo["readers.copc"])
 
     req = urllib.request.Request(href, headers={"Range": "bytes=0-127"})
-    header = urllib.request.urlopen(req).read()
+    header = _retry(lambda: urllib.request.urlopen(req).read())
     creation_doy, creation_year = struct.unpack("<HH", header[90:94])
 
     spatialreference = CRS.from_wkt(info["srs"]["compoundwkt"])
@@ -70,12 +114,21 @@ def create_item_fast(href, a_srs="EPSG:4326"):
         properties={},
     )
     item.add_asset(
-        "pointcloud",
+        "data",
         Asset(
             href=href,
-            media_type="application/octet-stream",
+            media_type="application/vnd.laszip+copc",
             roles=["data"],
-            title=f"{encoding} point cloud",
+            title="copc data",
+        ),
+    )
+    item.add_asset(
+        "thumbnail",
+        Asset(
+            href=_thumbnail_href(href, id),
+            media_type="image/png",
+            roles=["thumbnail"],
+            title="thumbnail",
         ),
     )
 

@@ -222,3 +222,7 @@ __marimo__/
 
 # project specific
 pointcloud.ipynb
+items
+items/*
+csv
+csv/*
